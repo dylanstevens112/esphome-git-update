@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -14,12 +15,21 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import CONF_BRANCH, CONF_REPO_URL, CONF_TOKEN, POLL_INTERVAL
+from .const import (
+    CONF_BRANCH,
+    CONF_IGNORED_FILES,
+    CONF_REPO_URL,
+    CONF_REVISION_ENTITY,
+    CONF_TOKEN,
+    LOCAL_SUFFIX,
+    POLL_INTERVAL,
+)
 
 _LOGGER = logging.getLogger(__name__)
 TIMEOUT = aiohttp.ClientTimeout(total=20)
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_MESSAGE_CHARS = 4000
+MAX_PATH_CHARS = 4096
 SHA = re.compile(r"[0-9a-f]{7,64}")
 # Git branch names: no spaces, control characters or "..", not starting with "-".
 BRANCH = re.compile(r"(?!-)(?!.*\.\.)[A-Za-z0-9._/\-]{1,200}")
@@ -28,6 +38,41 @@ BRANCH = re.compile(r"(?!-)(?!.*\.\.)[A-Za-z0-9._/\-]{1,200}")
 def is_commit(text: str | None) -> bool:
     """A (short or full) commit hash, as Gitea and the device report them."""
     return bool(text) and SHA.fullmatch(text) is not None
+
+
+def device_revision(value: str | None) -> str | None:
+    """What a revision sensor reports: a commit, optionally "+local", else None."""
+    if value is None:
+        return None
+    value = value.strip().lower()
+    return value if is_commit(value.removesuffix(LOCAL_SUFFIX)) else None
+
+
+def same_commit(a: str, b: str) -> bool:
+    """Short and full hashes of one commit (the device may report either)."""
+    return a.startswith(b) or b.startswith(a)
+
+
+def ignored(path: str, patterns: list[str]) -> bool:
+    """A file matches one of the patterns ("*.md", "docs/", "docs/*.txt").
+
+    As in fnmatch, "*" also matches "/", so "*.md" matches every Markdown file.
+    A pattern ending in "/" matches everything in that folder.
+    """
+    return any(
+        path.startswith(p) if p.endswith("/") else fnmatchcase(path, p) for p in patterns
+    )
+
+
+def needs_build(commit: Commit, patterns: list[str]) -> bool:
+    """Whether a commit changes a file that is not ignored.
+
+    Unknown files count as a change, so an unexpected answer never hides an
+    update.
+    """
+    if commit.files is None:
+        return True
+    return any(not ignored(f, patterns) for f in commit.files)
 
 
 class GiteaError(Exception):
@@ -57,6 +102,8 @@ class Commit:
 
     sha: str
     message: str
+    # Paths the commit changes; None when Gitea did not say.
+    files: tuple[str, ...] | None = None
 
     @property
     def short(self) -> str:
@@ -68,11 +115,16 @@ class Commit:
         return lines[0].strip() if lines else ""
 
 
-def _commit(sha: Any, message: Any) -> Commit:
+def _commit(sha: Any, message: Any, files: Any = None) -> Commit:
     if not isinstance(sha, str) or not is_commit(sha.lower()):
         raise GiteaError("unexpected answer")
     text = message if isinstance(message, str) else ""
-    return Commit(sha=sha.lower(), message=text[:MAX_MESSAGE_CHARS])
+    paths: tuple[str, ...] | None = None
+    if isinstance(files, list):
+        names = [f.get("filename") if isinstance(f, dict) else None for f in files]
+        if all(isinstance(n, str) and 0 < len(n) <= MAX_PATH_CHARS for n in names):
+            paths = tuple(names)
+    return Commit(sha=sha.lower(), message=text[:MAX_MESSAGE_CHARS], files=paths)
 
 
 class GiteaRepo:
@@ -158,7 +210,9 @@ class GiteaRepo:
         result = []
         for item in commits:
             if isinstance(item, dict) and isinstance(item.get("commit"), dict):
-                result.append(_commit(item.get("sha"), item["commit"].get("message")))
+                result.append(
+                    _commit(item.get("sha"), item["commit"].get("message"), item.get("files"))
+                )
         return result
 
     def compare_url(self, base: str, head: str) -> str | None:
@@ -167,7 +221,18 @@ class GiteaRepo:
         return f"{self.web_url}/compare/{base}...{head}"
 
 
-class GiteaCoordinator(DataUpdateCoordinator[Commit]):
+@dataclass(frozen=True)
+class Branch:
+    """The branch, and what changed since the device's commit when that matters."""
+
+    tip: Commit
+    # With ignored files set: the device commit the changes were read for, and
+    # the commits after it up to the tip (None when they could not be read).
+    base: str | None = None
+    changes: tuple[Commit, ...] | None = None
+
+
+class GiteaCoordinator(DataUpdateCoordinator[Branch]):
     """Checks the branch every few minutes."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -184,9 +249,27 @@ class GiteaCoordinator(DataUpdateCoordinator[Commit]):
             entry.data[CONF_BRANCH],
             entry.data.get(CONF_TOKEN) or None,
         )
+        self.revision_entity: str = entry.data[CONF_REVISION_ENTITY]
+        self.ignored_files: list[str] = list(entry.data.get(CONF_IGNORED_FILES) or [])
 
-    async def _async_update_data(self) -> Commit:
+    async def _async_update_data(self) -> Branch:
         try:
-            return await self.repo.latest()
+            tip = await self.repo.latest()
         except GiteaError as err:
             raise UpdateFailed(f"Could not read {self.repo.web_url} ({err})") from err
+        if not self.ignored_files:
+            return Branch(tip)
+        state = self.hass.states.get(self.revision_entity)
+        revision = device_revision(state.state if state else None)
+        if revision is None:
+            return Branch(tip)
+        base = revision.removesuffix(LOCAL_SUFFIX)
+        if same_commit(base, tip.sha):
+            return Branch(tip, base, ())
+        try:
+            changes = await self.repo.changes(base, tip.sha)
+        except GiteaError as err:
+            # Not knowing what changed means offering the update, as without a filter.
+            _LOGGER.debug("Could not compare %s with %s (%s)", base, tip.short, err)
+            return Branch(tip, base, None)
+        return Branch(tip, base, tuple(changes))

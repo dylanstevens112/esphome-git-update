@@ -516,3 +516,150 @@ async def test_saved_http_token_is_refused_without_sending(hass, aioclient_mock)
     await hass.config_entries.async_setup(entry.entry_id)
     assert entry.state is config_entries.ConfigEntryState.SETUP_ERROR
     assert aioclient_mock.call_count == 0
+
+
+# --- ignored files ----------------------------------------------------------
+
+IGNORE = {**DATA, "ignored_files": ["*.md", "docs/"]}
+
+
+def commit(sha, title, *files):
+    item = {"sha": sha, "commit": {"message": f"{title}\n\nbody"}}
+    if files != (None,):
+        item["files"] = [{"filename": f, "status": "modified"} for f in files]
+    return item
+
+
+def mock_compare(aioclient_mock, *commits, base="b675152", status=200):
+    aioclient_mock.get(
+        f"{API}/compare/{base}...{NEW}", json={"commits": list(commits)}, status=status
+    )
+
+
+def test_patterns():
+    from custom_components.esphome_git_update.config_flow import parse_patterns
+    from custom_components.esphome_git_update.gitea import ignored
+
+    assert parse_patterns(" *.md\n\n./docs/, /LICENSE\n*.md ") == ["*.md", "docs/", "LICENSE"]
+    assert parse_patterns("") == []
+    assert parse_patterns("x" * 201) is None
+    assert parse_patterns("\n".join(f"p{i}" for i in range(51))) is None
+    patterns = ["*.md", "docs/", "ha/*"]
+    assert ignored("README.md", patterns)
+    assert ignored("panel/notes/a.md", patterns)  # "*" crosses folders
+    assert ignored("docs/build/x.yaml", patterns)
+    assert ignored("ha/custom/thing.py", patterns)
+    assert not ignored("panel/panel.yaml", patterns)
+    assert not ignored("docsite/x.yaml", patterns)  # "docs/" is a folder only
+    assert not ignored("README.MD", patterns)  # case matters, as in Git
+
+
+async def test_commits_changing_only_ignored_files_are_not_offered(
+    hass, aioclient_mock, hass_ws_client
+):
+    mock_compare(
+        aioclient_mock,
+        commit(NEW, "docs: spec", "docs/overview-spec.md"),
+        commit("ee36859aaaa", "docs: readme", "README.md", "docs/a.png"),
+    )
+    await setup(hass, aioclient_mock, data=IGNORE)
+    state = hass.states.get(ENTITY)
+    assert state.state == "off"
+    assert state.attributes["installed_version"] == "b675152"
+    assert state.attributes["latest_version"] == "30736b4"
+    assert "No commit needs a new build: 2 commits" in await notes(hass, hass_ws_client)
+
+
+async def test_only_commits_needing_a_build_are_listed(hass, aioclient_mock, hass_ws_client):
+    mock_compare(
+        aioclient_mock,
+        commit(NEW, "docs: spec", "docs/overview-spec.md"),
+        commit("ee36859aaaa", "fix: brightness", "README.md", "panel/display.yaml"),
+        commit("6b8280baaaa", "chore: merge"),  # changes no files
+    )
+    await setup(hass, aioclient_mock, data=IGNORE)
+    state = hass.states.get(ENTITY)
+    assert state.state == "on"
+    assert state.attributes["release_summary"] == "fix: brightness"
+    text = await notes(hass, hass_ws_client)
+    assert "**1 new commit**" in text
+    assert "- `ee36859` fix: brightness" in text
+    assert "docs: spec" not in text
+    assert "2 other commits only change ignored files." in text
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"status": 500},
+        {"commits": [commit(NEW, "docs: spec", None)]},  # Gitea did not list files
+        {"commits": [{"sha": NEW, "commit": {"message": "x"}, "files": [{"filename": 3}]}]},
+    ],
+)
+async def test_unknown_changes_are_offered(hass, aioclient_mock, answer):
+    if "status" in answer:
+        mock_compare(aioclient_mock, status=answer["status"])
+    else:
+        mock_compare(aioclient_mock, *answer["commits"])
+    await setup(hass, aioclient_mock, data=IGNORE)
+    assert hass.states.get(ENTITY).state == "on"
+
+
+async def test_new_device_commit_is_checked_again(hass, aioclient_mock):
+    mock_compare(aioclient_mock, commit(NEW, "fix: brightness", "panel/display.yaml"))
+    mock_compare(aioclient_mock, commit(NEW, "docs: spec", "README.md"), base="ee36859")
+    await setup(hass, aioclient_mock, data=IGNORE)
+    assert hass.states.get(ENTITY).state == "on"
+
+    changes = []
+    hass.bus.async_listen("state_changed", lambda e: changes.append(e.data["new_state"]))
+    hass.states.async_set(REV, "ee36859")
+    await hass.async_block_till_done()
+    mine = [s for s in changes if s.entity_id == ENTITY]
+    assert [s.state for s in mine] == ["off"]  # straight to "off", no flicker
+    assert mine[-1].attributes["installed_version"] == "ee36859"
+
+    hass.states.async_set(REV, "30736b4")  # on the tip: nothing to compare
+    await hass.async_block_till_done()
+    assert hass.states.get(ENTITY).state == "off"
+
+
+async def test_local_build_with_ignored_files_is_still_offered(hass, aioclient_mock):
+    mock_compare(aioclient_mock, commit(NEW, "docs: spec", "README.md"))
+    await setup(hass, aioclient_mock, revision="b675152+local", data=IGNORE)
+    assert hass.states.get(ENTITY).state == "on"
+
+
+async def test_no_filter_reads_no_comparison(hass, aioclient_mock):
+    await setup(hass, aioclient_mock)
+    assert not any("/compare/" in str(c[1]) for c in aioclient_mock.mock_calls)
+
+
+async def test_flow_saves_and_shows_ignored_files(hass, aioclient_mock):
+    entry = await setup(hass, aioclient_mock)
+    details = {"revision_entity": REV, "repo_url": REPO, "branch": "main"}
+
+    result = await entry.start_reconfigure_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {**details, "ignored_files": "x" * 300}
+    )
+    assert result["errors"] == {"ignored_files": "invalid_patterns"}
+    schema = {str(k): k for k in result["data_schema"].schema}
+    assert schema["ignored_files"].default() == "x" * 300  # kept for fixing
+
+    mock_compare(aioclient_mock, commit(NEW, "docs", "README.md"))
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {**details, "ignored_files": "*.md\ndocs/"}
+    )
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data["ignored_files"] == ["*.md", "docs/"]
+    await hass.async_block_till_done()
+    assert hass.states.get(ENTITY).state == "off"
+
+    result = await entry.start_reconfigure_flow(hass)
+    schema = {str(k): k for k in result["data_schema"].schema}
+    assert schema["ignored_files"].default() == "*.md\ndocs/"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {**details, "ignored_files": " "}
+    )
+    assert "ignored_files" not in entry.data  # cleared

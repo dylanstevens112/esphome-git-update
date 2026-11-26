@@ -26,15 +26,23 @@ from .const import (
     CONF_CONFIGURATION,
     CONF_REVISION_ENTITY,
     DOMAIN,
+    LOCAL_SUFFIX,
     UPLOAD_ATTEMPTS,
     UPLOAD_RETRY_DELAY_S,
     UPLOAD_TIMEOUT_S,
 )
-from .gitea import GiteaCoordinator, GiteaError, is_commit
+from .gitea import (
+    Commit,
+    GiteaCoordinator,
+    GiteaError,
+    device_revision,
+    is_commit,
+    needs_build,
+    same_commit,
+)
 
 _LOGGER = logging.getLogger(__name__)
 MAX_NOTES = 30
-LOCAL_SUFFIX = "+local"  # a build with uncommitted changes
 
 
 def _markdown_text(text: str) -> str:
@@ -90,7 +98,27 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
 
     @callback
     def _revision_changed(self, event: Event[EventStateChangedData]) -> None:
-        self.async_write_ha_state()
+        if self.coordinator.ignored_files:
+            # What the device lacks must be read again first; the refresh
+            # writes the state, so it never flips to "update" in between.
+            self.hass.async_create_task(self.coordinator.async_request_refresh())
+        else:
+            self.async_write_ha_state()
+
+    def _changes(self) -> tuple[Commit, ...] | None:
+        """With ignored files: the commits the device lacks, if known."""
+        data, installed = self.coordinator.data, self._installed_commit()
+        if (
+            not self.coordinator.ignored_files
+            or data is None
+            or installed is None
+            or data.base != installed
+        ):
+            return None
+        return data.changes
+
+    def _needing_build(self, commits: tuple[Commit, ...] | list[Commit]) -> list[Commit]:
+        return [c for c in commits if needs_build(c, self.coordinator.ignored_files)]
 
     def _installed_commit(self) -> str | None:
         """The commit the device runs, without the "+local" mark."""
@@ -103,18 +131,13 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
     @property
     def installed_version(self) -> str | None:
         state = self.hass.states.get(self._revision_entity)
-        if state is None:
-            return None
-        value = state.state.strip().lower()
         # Only a commit (optionally "+local") counts; "unknown", "unavailable"
         # or anything else the device sends leaves the version unknown.
-        if not is_commit(value.removesuffix(LOCAL_SUFFIX)):
-            return None
-        return value
+        return device_revision(state.state if state else None)
 
     @property
     def latest_version(self) -> str | None:
-        return self.coordinator.data.short if self.coordinator.data else None
+        return self.coordinator.data.tip.short if self.coordinator.data else None
 
     def version_is_newer(self, latest_version: str, installed_version: str) -> bool:
         # Commits have no order: any difference is an update, and a build with
@@ -122,14 +145,21 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
         # longer or shorter hash than the 7 characters shown here.
         if installed_version.endswith(LOCAL_SUFFIX):
             return True
-        return not (
-            installed_version.startswith(latest_version)
-            or latest_version.startswith(installed_version)
-        )
+        if same_commit(installed_version, latest_version):
+            return False
+        # With ignored files, only commits that change other files count.
+        # Unknown changes count, as without a filter.
+        changes = self._changes()
+        return changes is None or bool(self._needing_build(changes))
 
     @property
     def release_summary(self) -> str | None:
-        return self.coordinator.data.title[:255] if self.coordinator.data else None
+        if not self.coordinator.data:
+            return None
+        changes = self._changes()
+        relevant = self._needing_build(changes) if changes else []
+        title = relevant[0].title if relevant else self.coordinator.data.tip.title
+        return title[:255]
 
     @property
     def release_url(self) -> str | None:
@@ -142,17 +172,32 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
         installed, latest = self._installed_commit(), self.latest_version
         if not installed or not latest or not self.coordinator.data:
             return None
-        try:
-            commits = await self.coordinator.repo.changes(installed, latest)
-        except GiteaError:
-            commits = []
+        # With ignored files the comparison was already read; reuse it.
+        commits = list(self._changes() or [])
         if not commits:
-            return _markdown_text(self.coordinator.data.title)
+            try:
+                commits = await self.coordinator.repo.changes(installed, latest)
+            except GiteaError:
+                commits = []
+        if not commits:
+            return _markdown_text(self.coordinator.data.tip.title)
+        skipped = 0
+        if self.coordinator.ignored_files:
+            relevant = self._needing_build(commits)
+            skipped = len(commits) - len(relevant)
+            commits = relevant
+        if not commits:
+            plural = "s" if skipped != 1 else ""
+            return f"No commit needs a new build: {skipped} commit{plural} only change ignored files."
         lines = [f"- `{c.short}` {_markdown_text(c.title)}" for c in commits[:MAX_NOTES]]
         if len(commits) > MAX_NOTES:
             lines.append(f"- … and {len(commits) - MAX_NOTES} older")
         plural = "s" if len(commits) != 1 else ""
-        return f"**{len(commits)} new commit{plural}**\n\n" + "\n".join(lines)
+        text = f"**{len(commits)} new commit{plural}**\n\n" + "\n".join(lines)
+        if skipped:
+            plural = "s" if skipped != 1 else ""
+            text += f"\n\n{skipped} other commit{plural} only change ignored files."
+        return text
 
     async def async_install(self, version: str | None, backup: bool, **kwargs: Any) -> None:
         if self._install_lock.locked():

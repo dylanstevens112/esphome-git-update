@@ -9,7 +9,8 @@ has a commit the device is not running, and installs it with one tap from
 **Settings → Updates** or the device page.
 
 - **Update available** when the branch's newest commit differs from the commit
-  the device reports (checked every 5 minutes).
+  the device reports (checked every 5 minutes). Optionally, commits that only
+  change files such as `*.md` or `docs/` are not offered.
 - **Release notes** list the commits since the installed one, and the link opens
   the repository's comparison.
 - **Install** asks ESPHome Device Builder to build the device and upload it over
@@ -36,7 +37,8 @@ has a commit the device is not running, and installs it with one tap from
 
 - A text sensor on the device that reports the Git commit it was built from
   (7 or more hex characters, `+local` allowed for builds with uncommitted
-  changes). See [Reporting the commit](#reporting-the-commit).
+  changes). This repository ships an ESPHome component for that: see
+  [Reporting the commit](#reporting-the-commit).
 
 ## Install
 
@@ -57,6 +59,18 @@ By hand: copy `custom_components/esphome_git_update` to
    A token is only needed for a private repository: create one in Gitea with
    **repository: read** and nothing else. A token needs the repository's
    `https` address.
+3. Optionally list the files whose changes need no new build, one pattern per
+   line, for example:
+
+   ```text
+   *.md
+   docs/
+   ```
+
+   A commit that only changes matching files is then not offered as an update.
+   `*` also matches `/` (so `*.md` matches Markdown files in every folder), and
+   a pattern ending in `/` matches a whole folder. Paths are relative to the
+   repository root and case-sensitive.
 
 Settings can be changed later with **Reconfigure**. A saved token is never shown
 again; leave the field empty to keep it (only while the server stays the
@@ -66,44 +80,24 @@ The update appears on the device's page as **Code**.
 
 ## Reporting the commit
 
-The device must report its commit. One way is a small external component kept
-in the device's own repository, which asks Git at build time:
-
-```python
-# components/git_revision/__init__.py
-from pathlib import Path
-import subprocess
-
-import esphome.codegen as cg
-import esphome.config_validation as cv
-
-CONFIG_SCHEMA = cv.Schema({})
-
-
-def _git(*args):
-    root = Path(__file__).resolve().parents[2]  # the repository checkout
-    done = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, check=False)
-    return done.stdout.strip() if done.returncode == 0 else ""
-
-
-async def to_code(config):
-    commit = _git("rev-parse", "--short=7", "HEAD") or "unknown"
-    if commit != "unknown" and _git("status", "--porcelain", "--untracked-files=no"):
-        commit += "+local"
-    cg.add_define("GIT_REVISION", commit)  # ESPHome makes it a C string
-```
+The device must report the commit it was built from. The `git_revision`
+component in this repository does that at build time:
 
 ```yaml
-external_components:
-  - source:
-      type: git
-      url: https://git.example.com/owner/repo
-      ref: main
-      path: components
+packages:
+  device:
+    url: https://git.example.com/owner/repo
+    ref: main
+    files: [device.yaml]
     refresh: 0s
+
+external_components:
+  - source: github://dylanstevens112/esphome-git-update@v1.1.0
     components: [git_revision]
 
 git_revision:
+  url: https://git.example.com/owner/repo  # the package's url and ref, exactly
+  ref: main
 
 text_sensor:
   - platform: template
@@ -112,6 +106,20 @@ text_sensor:
     update_interval: never
     lambda: return std::string(GIT_REVISION);
 ```
+
+- With `url` (and `ref`, if the package sets one), the commit is read from
+  ESPHome's own checkout of that package: the code the build really used, not
+  a second copy fetched separately. Nothing is fetched again. If no package has
+  that url and ref, validation fails and lists the packages that were fetched.
+- Without `url`, the commit is read from the Git checkout that holds the
+  device's YAML file, with `+local` added when tracked files have uncommitted
+  changes. Use this when building from a local clone.
+- If the commit cannot be read, the sensor reports `unknown` and no update is
+  offered until it can.
+
+`GIT_REVISION` is a C string, so the sensor above works unchanged if you used
+an older copy of this component kept in your own repository: replace that
+copy's `external_components` entry and add `url` and `ref`.
 
 ## Security
 
@@ -136,7 +144,8 @@ text_sensor:
 
 ## Limits
 
-- Any new commit counts, including ones that do not change the firmware.
+- Any new commit counts, including ones that do not change the firmware,
+  unless its files are listed under the files that need no new build.
 - Install builds the newest commit at the time of the build, which may be newer
   than the one shown if a commit lands in between.
 - Install uses Home Assistant's connection to Device Builder, which is not a

@@ -19,14 +19,38 @@ from homeassistant.helpers import selector
 from .const import (
     CONF_BRANCH,
     CONF_CONFIGURATION,
+    CONF_IGNORED_FILES,
     CONF_REPO_URL,
     CONF_REVISION_ENTITY,
     CONF_TOKEN,
     DEFAULT_BRANCH,
     DOMAIN,
+    MAX_IGNORED_PATTERNS,
+    MAX_PATTERN_CHARS,
     REVISION_SENSOR_WORDS,
 )
 from .gitea import GiteaError, GiteaRepo, InsecureTokenError, origin
+
+
+def _pattern_text(value: Any) -> str:
+    """Saved patterns (a list) or the text just entered, for the form."""
+    if isinstance(value, list):
+        return "\n".join(value)
+    return value if isinstance(value, str) else ""
+
+
+def parse_patterns(text: str) -> list[str] | None:
+    """One pattern per line (or comma separated); None if any is unusable."""
+    patterns: list[str] = []
+    for part in text.replace(",", "\n").splitlines():
+        pattern = part.strip().removeprefix("./").lstrip("/")
+        if not pattern:
+            continue
+        if len(pattern) > MAX_PATTERN_CHARS or any(ord(ch) < 32 for ch in pattern):
+            return None
+        if pattern not in patterns:
+            patterns.append(pattern)
+    return patterns if len(patterns) <= MAX_IGNORED_PATTERNS else None
 
 
 class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -122,6 +146,11 @@ class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_BRANCH: values[CONF_BRANCH],
                 CONF_TOKEN: token,
             }
+            patterns = parse_patterns(values.get(CONF_IGNORED_FILES) or "")
+            if patterns is None:
+                errors[CONF_IGNORED_FILES] = "invalid_patterns"
+            else:
+                data[CONF_IGNORED_FILES] = patterns
             if self.hass.states.get(data[CONF_REVISION_ENTITY]) is None:
                 errors[CONF_REVISION_ENTITY] = "unknown_entity"
             else:
@@ -137,6 +166,8 @@ class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
                     except GiteaError:
                         errors["base"] = "cannot_read_repo"
             if not errors:
+                if not data.get(CONF_IGNORED_FILES):
+                    data.pop(CONF_IGNORED_FILES, None)
                 if reconfigure:
                     return self.async_update_reload_and_abort(
                         self._get_reconfigure_entry(), data=data
@@ -144,6 +175,7 @@ class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
                 return self.async_create_entry(title=self._title or self._configuration, data=data)
             # Never put a token back into the form.
             current = {**current, **{k: v for k, v in data.items() if k != CONF_TOKEN}}
+            current[CONF_IGNORED_FILES] = values.get(CONF_IGNORED_FILES) or ""
 
         schema: dict[Any, Any] = {
             vol.Required(
@@ -154,6 +186,9 @@ class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
                 selector.TextSelectorConfig(type=selector.TextSelectorType.URL)
             ),
             vol.Required(CONF_BRANCH, default=current.get(CONF_BRANCH, DEFAULT_BRANCH)): str,
+            vol.Optional(
+                CONF_IGNORED_FILES, default=_pattern_text(current.get(CONF_IGNORED_FILES))
+            ): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
             # Never shown back: a saved token stays saved unless replaced or cleared.
             vol.Optional(CONF_TOKEN): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)

@@ -8,6 +8,10 @@ CONF_BRANCH = "branch"
 CONF_TOKEN = "token"
 CONF_REVISION_ENTITY = "revision_entity"
 CONF_CONFIGURATION = "configuration"
+# Path patterns of files whose changes need no new build (e.g. *.md, docs/).
+CONF_IGNORED_FILES = "ignored_files"
+MAX_IGNORED_PATTERNS = 50
+MAX_PATTERN_CHARS = 200
 
 DEFAULT_BRANCH = "main"
 
@@ -22,3 +26,5 @@ UPLOAD_TIMEOUT_S = 15 * 60
 # Words that mark a device's "which commit am I running" sensor, used only to
 # suggest it in the setup form.
 REVISION_SENSOR_WORDS = ("revision", "commit", "git")
+# A build with uncommitted changes reports its commit with this suffix.
+LOCAL_SUFFIX = "+local"
