@@ -1,0 +1,14 @@
+# Test environment (Python 3.14). The kit pins its Home Assistant version.
+pytest-homeassistant-custom-component==0.13.375
+# Imported by Home Assistant's ESPHome integration, which this one depends on.
+aioesphomeapi
+esphome-dashboard-api
+aiousbwatcher
+serialx
+hassil
+gazetteer-matcher
+mutagen
+ha-ffmpeg
+pymicro-vad
+pyspeex-noise
+bleak-esphome

@@ -1,0 +1,64 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Choose the device",
+        "description": "Pick the ESPHome Device Builder configuration that is built from a Git repository. Each device is added separately.",
+        "data": {
+          "configuration": "Device Builder configuration"
+        }
+      },
+      "details": {
+        "title": "Where {device} gets its code",
+        "description": "An update is offered whenever the branch has a commit the device is not running. Install builds the device in ESPHome Device Builder and uploads it.",
+        "data": {
+          "revision_entity": "Sensor with the commit the device runs",
+          "repo_url": "Gitea or Forgejo repository address",
+          "branch": "Branch",
+          "token": "Access token (only for a private repository)",
+          "clear_token": "Remove the saved access token"
+        },
+        "data_description": {
+          "revision_entity": "A text sensor on the device that reports the Git commit it was built from, e.g. 1a2b3c4.",
+          "repo_url": "The repository's web address, e.g. https://git.example.com/owner/repo.",
+          "token": "A read-only token. Leave empty for a public repository, or to keep the saved token."
+        }
+      }
+    },
+    "error": {
+      "cannot_read_repo": "Could not read that branch. Check the address, branch and token.",
+      "invalid_repo": "That is not a repository address (http or https, ending in owner/repository) or a valid branch name.",
+      "unknown_entity": "That sensor does not exist."
+    },
+    "abort": {
+      "already_configured": "This device is already set up.",
+      "all_configured": "Every ESPHome Device Builder device is already set up.",
+      "no_device_builder": "ESPHome Device Builder is not connected to Home Assistant. Install the ESPHome Device Builder app and make sure Home Assistant's ESPHome integration finds it.",
+      "reconfigure_successful": "Settings saved."
+    }
+  },
+  "entity": {
+    "update": {
+      "code": {
+        "name": "Code"
+      }
+    }
+  },
+  "exceptions": {
+    "install_running": {
+      "message": "{device} is already being updated."
+    },
+    "no_device_builder": {
+      "message": "ESPHome Device Builder is not available."
+    },
+    "unknown_configuration": {
+      "message": "ESPHome Device Builder has no configuration {configuration}."
+    },
+    "build_failed": {
+      "message": "Building {configuration} failed. See the ESPHome Device Builder log."
+    },
+    "upload_failed": {
+      "message": "Uploading to {device} failed. See the ESPHome Device Builder log."
+    }
+  }
+}
