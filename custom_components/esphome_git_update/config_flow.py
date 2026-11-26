@@ -1,6 +1,7 @@
 """Set up ESPHome Git Update from the UI: one entry per Device Builder device."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import voluptuous as vol
@@ -20,6 +21,7 @@ from .const import (
     CONF_BRANCH,
     CONF_CONFIGURATION,
     CONF_IGNORED_FILES,
+    CONF_NODE_NAME,
     CONF_REPO_URL,
     CONF_REVISION_ENTITY,
     CONF_TOKEN,
@@ -29,7 +31,8 @@ from .const import (
     MAX_PATTERN_CHARS,
     REVISION_SENSOR_WORDS,
 )
-from .gitea import GiteaError, GiteaRepo, InsecureTokenError, origin
+from .devices import builder_node_name, sensor_node_name
+from .gitea import GiteaAuthError, GiteaError, GiteaRepo, InsecureTokenError, origin
 
 
 def _pattern_text(value: Any) -> str:
@@ -116,7 +119,50 @@ class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
         entry = self._get_reconfigure_entry()
         self._configuration = entry.data[CONF_CONFIGURATION]
         self._title = entry.title
+        self._node_name = entry.data.get(CONF_NODE_NAME) or builder_node_name(
+            self.hass, self._configuration
+        )
         return await self.async_step_details()
+
+    async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> ConfigFlowResult:
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Gitea refused the token: ask for a new one."""
+        entry = self._get_reauth_entry()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            token = (user_input.get(CONF_TOKEN) or "").strip()
+            try:
+                repo = GiteaRepo(
+                    self.hass, entry.data[CONF_REPO_URL], entry.data[CONF_BRANCH], token or None
+                )
+                await repo.latest()
+            except InsecureTokenError:
+                errors["base"] = "token_needs_https"
+            except GiteaAuthError:
+                errors["base"] = "invalid_auth"
+            except GiteaError:
+                errors["base"] = "cannot_read_repo"
+            else:
+                return self.async_update_reload_and_abort(entry, data_updates={CONF_TOKEN: token})
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(CONF_TOKEN): selector.TextSelector(
+                        selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+                    )
+                }
+            ),
+            errors=errors,
+            description_placeholders={
+                "device": entry.title,
+                "repo_url": entry.data[CONF_REPO_URL],
+            },
+        )
 
     async def async_step_details(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         reconfigure = self.source == SOURCE_RECONFIGURE
@@ -151,8 +197,15 @@ class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors[CONF_IGNORED_FILES] = "invalid_patterns"
             else:
                 data[CONF_IGNORED_FILES] = patterns
+            if self._node_name:
+                data[CONF_NODE_NAME] = self._node_name
+            owner = sensor_node_name(self.hass, data[CONF_REVISION_ENTITY])
             if self.hass.states.get(data[CONF_REVISION_ENTITY]) is None:
                 errors[CONF_REVISION_ENTITY] = "unknown_entity"
+            elif self._node_name and owner and owner != self._node_name:
+                # Install flashes the chosen configuration; a sensor from another
+                # ESPHome device would put that update on the wrong device.
+                errors[CONF_REVISION_ENTITY] = "other_device"
             else:
                 try:
                     repo = GiteaRepo(self.hass, data[CONF_REPO_URL], data[CONF_BRANCH], token or None)
@@ -163,6 +216,8 @@ class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
                 else:
                     try:
                         await repo.latest()
+                    except GiteaAuthError:
+                        errors["base"] = "invalid_auth"
                     except GiteaError:
                         errors["base"] = "cannot_read_repo"
             if not errors:

@@ -15,6 +15,7 @@ from homeassistant.components.update import (
 )
 from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device import async_entity_id_to_device
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
@@ -24,6 +25,7 @@ from . import GitUpdateConfigEntry, build_lock
 from .const import (
     COMPILE_TIMEOUT_S,
     CONF_CONFIGURATION,
+    CONF_NODE_NAME,
     CONF_REVISION_ENTITY,
     DOMAIN,
     LOCAL_SUFFIX,
@@ -31,6 +33,7 @@ from .const import (
     UPLOAD_RETRY_DELAY_S,
     UPLOAD_TIMEOUT_S,
 )
+from .devices import builder_node_name, node_device, sensor_node_name
 from .gitea import (
     Commit,
     GiteaCoordinator,
@@ -77,9 +80,10 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
         self._attr_unique_id = f"{entry.entry_id}_code"
         self._attr_title = entry.title
         self._attr_in_progress = False
-        # Show the update on the ESPHome device the revision sensor belongs to
-        # (how Home Assistant's own helpers join another integration's device).
-        device = async_entity_id_to_device(hass, self._revision_entity)
+        # Show the update on the device Install flashes: the one built from the
+        # chosen configuration (how Home Assistant's own helpers join another
+        # integration's device).
+        device = self._device(hass, entry)
         if device is not None:
             self.device_entry = device
         else:  # no device: stand alone, named after the entry
@@ -87,6 +91,16 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
             self._attr_translation_key = None
             self._attr_name = f"{entry.title} code"
         self._install_lock = asyncio.Lock()
+
+    def _device(self, hass: HomeAssistant, entry: GitUpdateConfigEntry) -> dr.DeviceEntry | None:
+        node = entry.data.get(CONF_NODE_NAME) or builder_node_name(hass, self._configuration)
+        if node and (device := node_device(hass, node)) is not None:
+            return device
+        # Otherwise the sensor's device, but never another ESPHome device's.
+        owner = sensor_node_name(hass, self._revision_entity)
+        if node and owner and owner != node:
+            return None
+        return async_entity_id_to_device(hass, self._revision_entity)
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -145,7 +159,10 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
         # longer or shorter hash than the 7 characters shown here.
         if installed_version.endswith(LOCAL_SUFFIX):
             return True
-        if same_commit(installed_version, latest_version):
+        # Compare with the full hash: the device may report one, and two
+        # commits can share the 7 characters shown.
+        tip = self.coordinator.data.tip.sha if self.coordinator.data else latest_version
+        if same_commit(installed_version, tip):
             return False
         # With ignored files, only commits that change other files count.
         # Unknown changes count, as without a filter.

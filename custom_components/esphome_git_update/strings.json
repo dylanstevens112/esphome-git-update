@@ -25,6 +25,13 @@
           "token": "A read-only token, sent only over https and only to this server. Leave empty for a public repository. When reconfiguring, leave empty to keep the saved token (only while the server stays the same).",
           "ignored_files": "Optional. One file pattern per line, e.g. *.md or docs/. A commit that only changes matching files is not offered as an update. * also matches /, and a pattern ending in / matches a whole folder."
         }
+      },
+      "reauth_confirm": {
+        "title": "New access token for {device}",
+        "description": "Gitea refused the access token for {repo_url}: it is wrong, has expired or was removed. Enter a new read-only token, or leave the field empty if the repository is now public.",
+        "data": {
+          "token": "Access token"
+        }
       }
     },
     "error": {
@@ -32,13 +39,16 @@
       "invalid_repo": "That is not a repository address (http or https, ending in owner/repository) or a valid branch name.",
       "unknown_entity": "That sensor does not exist.",
       "token_needs_https": "A token is only sent over an encrypted connection. Use the repository's https address, or leave the token empty for a public repository.",
-      "invalid_patterns": "Use at most 50 patterns, one per line, each up to 200 characters."
+      "invalid_patterns": "Use at most 50 patterns, one per line, each up to 200 characters.",
+      "invalid_auth": "Gitea refused the access token. Check it, or create a new one with repository: read.",
+      "other_device": "That sensor belongs to another ESPHome device. Pick the sensor of the device that is built from this configuration."
     },
     "abort": {
       "already_configured": "This device is already set up.",
       "all_configured": "Every ESPHome Device Builder device is already set up.",
       "no_device_builder": "ESPHome Device Builder is not connected to Home Assistant. Install the ESPHome Device Builder app and make sure Home Assistant's ESPHome integration finds it.",
-      "reconfigure_successful": "Settings saved."
+      "reconfigure_successful": "Settings saved.",
+      "reauth_successful": "Access token saved."
     }
   },
   "entity": {

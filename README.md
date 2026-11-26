@@ -56,6 +56,8 @@ By hand: copy `custom_components/esphome_git_update` to
    offered again; add the integration once per device.
 2. Check the suggested commit sensor (one whose name contains "revision",
    "commit" or "git"), and enter the repository's web address and branch.
+   The sensor must belong to the device built from the chosen configuration:
+   the update shows on that device, and Install flashes it.
    A token is only needed for a private repository: create one in Gitea with
    **repository: read** and nothing else. A token needs the repository's
    `https` address.
@@ -71,6 +73,9 @@ By hand: copy `custom_components/esphome_git_update` to
    `*` also matches `/` (so `*.md` matches Markdown files in every folder), and
    a pattern ending in `/` matches a whole folder. Paths are relative to the
    repository root and case-sensitive.
+
+If Gitea later refuses the token (expired or removed), Home Assistant asks for
+a new one under **Settings → Devices & services** instead of retrying.
 
 Settings can be changed later with **Reconfigure**. A saved token is never shown
 again; leave the field empty to keep it (only while the server stays the
@@ -103,7 +108,7 @@ text_sensor:
   - platform: template
     name: Firmware revision
     entity_category: diagnostic
-    update_interval: never
+    update_interval: 1h  # publishes within seconds of boot, then hourly; "never" would never publish
     lambda: return std::string(GIT_REVISION);
 ```
 

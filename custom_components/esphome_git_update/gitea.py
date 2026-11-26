@@ -12,6 +12,7 @@ from urllib.parse import quote, urlsplit
 import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -77,6 +78,10 @@ def needs_build(commit: Commit, patterns: list[str]) -> bool:
 
 class GiteaError(Exception):
     """Gitea could not be read. The message never contains the token."""
+
+
+class GiteaAuthError(GiteaError):
+    """Gitea refused the request (401): the token is missing, wrong or expired."""
 
 
 class InsecureTokenError(GiteaError):
@@ -173,6 +178,8 @@ class GiteaRepo:
                 timeout=TIMEOUT,
                 allow_redirects=False,
             ) as resp:
+                if resp.status == 401:
+                    raise GiteaAuthError("Gitea answered 401")
                 if resp.status != 200:
                     raise GiteaError(f"Gitea answered {resp.status}")
                 length = resp.headers.get("Content-Length", "")
@@ -255,6 +262,9 @@ class GiteaCoordinator(DataUpdateCoordinator[Branch]):
     async def _async_update_data(self) -> Branch:
         try:
             tip = await self.repo.latest()
+        except GiteaAuthError as err:
+            # Retrying cannot fix a refused token; ask for a new one.
+            raise ConfigEntryAuthFailed(f"{self.repo.web_url} refused the access token") from err
         except GiteaError as err:
             raise UpdateFailed(f"Could not read {self.repo.web_url} ({err})") from err
         if not self.ignored_files:

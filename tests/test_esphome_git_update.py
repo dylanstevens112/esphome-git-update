@@ -440,7 +440,7 @@ async def test_flow_picks_device_and_suggests_its_sensor(hass, aioclient_mock, e
             )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "Panel"
-    assert result["data"] == {**DATA, "repo_url": HREPO + "/", "token": TOKEN}
+    assert result["data"] == {**DATA, "repo_url": HREPO + "/", "token": TOKEN, "node_name": "panel"}
     assert result["result"].unique_id == "panel.yaml"
 
 
@@ -663,3 +663,150 @@ async def test_flow_saves_and_shows_ignored_files(hass, aioclient_mock):
         result["flow_id"], {**details, "ignored_files": " "}
     )
     assert "ignored_files" not in entry.data  # cleared
+
+
+# --- review fixes -----------------------------------------------------------
+
+DEVICES = "custom_components.esphome_git_update.devices.async_get_dashboard"
+
+
+def esphome_device(hass, device_registry, entity_registry, node, mac, sensor):
+    """An ESPHome device with a revision sensor, as the ESPHome integration makes them."""
+    entry = MockConfigEntry(domain="esphome", title=node, data={"device_name": node})
+    entry.add_to_hass(hass)
+    device = device_registry.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        connections={(dr.CONNECTION_NETWORK_MAC, mac)},
+        name=node,
+    )
+    entity_registry.async_get_or_create(
+        "sensor", "esphome", f"{node}-rev", suggested_object_id=sensor.split(".")[1],
+        config_entry=entry, device_id=device.id, original_name="Firmware revision",
+    )
+    return device
+
+
+@pytest.mark.parametrize("saved_node", [True, False])
+async def test_update_shows_on_the_device_install_flashes(
+    hass, aioclient_mock, device_registry, entity_registry, saved_node
+):
+    """Panel's configuration with Other's sensor: shown on Panel, flashes Panel."""
+    panel = esphome_device(hass, device_registry, entity_registry, "panel", "80:f1:b2:00:00:01", "sensor.panel_x")
+    other = esphome_device(hass, device_registry, entity_registry, "other", "80:f1:b2:00:00:02", REV)
+    data = {**DATA, "node_name": "panel"} if saved_node else DATA
+    with patch(DEVICES, return_value=dashboard(devices={
+        "panel": {"name": "panel", "configuration": "panel.yaml"},
+        "other": {"name": "other", "configuration": "other.yaml"},
+    })):
+        await setup(hass, aioclient_mock, data=data)
+    ours = [e for e in entity_registry.entities.values() if e.platform == DOMAIN]
+    assert len(ours) == 1
+    assert ours[0].device_id == panel.id != other.id
+    dash = dashboard()
+    with patch(UPDATE, return_value=dash):
+        await install(hass)
+    dash.api.compile.assert_awaited_once_with("panel.yaml")
+
+
+async def test_never_shown_on_another_esphome_device(
+    hass, aioclient_mock, device_registry, entity_registry
+):
+    """Panel's device is unknown and the sensor is Other's: stand alone."""
+    esphome_device(hass, device_registry, entity_registry, "other", "80:f1:b2:00:00:02", REV)
+    await setup(hass, aioclient_mock, data={**DATA, "node_name": "panel"})
+    ours = [e for e in entity_registry.entities.values() if e.platform == DOMAIN]
+    assert len(ours) == 1 and ours[0].device_id is None
+
+
+async def test_flow_refuses_another_devices_sensor(
+    hass, aioclient_mock, device_registry, entity_registry
+):
+    hass.config.components.add("esphome")
+    esphome_device(hass, device_registry, entity_registry, "panel", "80:f1:b2:00:00:01", REV)
+    esphome_device(hass, device_registry, entity_registry, "other", "80:f1:b2:00:00:02", "sensor.other_rev")
+    hass.states.async_set(REV, "b675152")
+    hass.states.async_set("sensor.other_rev", "b675152")
+    mock_branch(aioclient_mock)
+    dash = dashboard(devices={
+        "panel": {"name": "panel", "configuration": "panel.yaml"},
+        "other": {"name": "other", "configuration": "other.yaml"},
+    })
+    details = {"repo_url": REPO, "branch": "main"}
+    with patch(FLOW, return_value=dash):
+        result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"configuration": "panel.yaml"}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**details, "revision_entity": "sensor.other_rev"}
+        )
+        assert result["errors"] == {"revision_entity": "other_device"}
+        with patch("custom_components.esphome_git_update.async_setup_entry", return_value=True):
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"], {**details, "revision_entity": REV}
+            )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    entry = result["result"]
+
+    # Reconfigure checks it too, finding the node name from Device Builder for
+    # entries saved before it was stored.
+    hass.config_entries.async_update_entry(
+        entry, data={k: v for k, v in entry.data.items() if k != "node_name"}
+    )
+    with patch(DEVICES, return_value=dash):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": "reconfigure", "entry_id": entry.entry_id}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**details, "revision_entity": "sensor.other_rev"}
+        )
+    assert result["errors"] == {"revision_entity": "other_device"}
+
+
+async def test_refused_token_asks_for_a_new_one(hass, aioclient_mock):
+    hass.config.components.add("esphome")
+    hass.states.async_set(REV, "b675152")
+    aioclient_mock.get(f"{HAPI}/branches/main", status=401)
+    entry = MockConfigEntry(
+        domain=DOMAIN, title="Panel", unique_id="panel.yaml",
+        data={**DATA, "repo_url": HREPO, "token": TOKEN},
+    )
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is config_entries.ConfigEntryState.SETUP_ERROR
+    flows = hass.config_entries.flow.async_progress()
+    assert len(flows) == 1 and flows[0]["context"]["source"] == "reauth"
+    flow_id = flows[0]["flow_id"]
+
+    result = await hass.config_entries.flow.async_configure(flow_id, {"token": "still-wrong"})
+    assert result["errors"] == {"base": "invalid_auth"}
+
+    aioclient_mock.clear_requests()
+    mock_branch(aioclient_mock, api=HAPI)
+    result = await hass.config_entries.flow.async_configure(flow_id, {"token": "new-token"})
+    assert result["reason"] == "reauth_successful"
+    assert entry.data["token"] == "new-token"
+    await hass.async_block_till_done()
+    assert entry.state is config_entries.ConfigEntryState.LOADED
+
+
+async def test_server_errors_still_retry(hass, aioclient_mock):
+    hass.config.components.add("esphome")
+    aioclient_mock.get(f"{HAPI}/branches/main", status=503)
+    entry = MockConfigEntry(domain=DOMAIN, data={**DATA, "repo_url": HREPO, "token": TOKEN})
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    assert entry.state is config_entries.ConfigEntryState.SETUP_RETRY
+    assert not hass.config_entries.flow.async_progress()
+
+
+async def test_full_hash_is_compared(hass, aioclient_mock):
+    """Same 7 characters, different commit: still an update."""
+    await setup(hass, aioclient_mock, revision="30736b4" + "0" * 33)
+    state = hass.states.get(ENTITY)
+    assert state.attributes["latest_version"] == "30736b4"
+    assert state.state == "on"
+    hass.states.async_set(REV, NEW)
+    await hass.async_block_till_done()
+    assert hass.states.get(ENTITY).state == "off"

@@ -8,6 +8,8 @@ CONF_BRANCH = "branch"
 CONF_TOKEN = "token"
 CONF_REVISION_ENTITY = "revision_entity"
 CONF_CONFIGURATION = "configuration"
+# The Device Builder device's node name, which ties the entry to its ESPHome device.
+CONF_NODE_NAME = "node_name"
 # Path patterns of files whose changes need no new build (e.g. *.md, docs/).
 CONF_IGNORED_FILES = "ignored_files"
 MAX_IGNORED_PATTERNS = 50
