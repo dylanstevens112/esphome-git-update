@@ -21,14 +21,15 @@
         "data_description": {
           "revision_entity": "A text sensor on the device that reports the Git commit it was built from, e.g. 1a2b3c4.",
           "repo_url": "The repository's web address, e.g. https://git.example.com/owner/repo.",
-          "token": "A read-only token. Leave empty for a public repository, or to keep the saved token."
+          "token": "A read-only token, sent only over https and only to this server. Leave empty for a public repository. When reconfiguring, leave empty to keep the saved token (only while the server stays the same)."
         }
       }
     },
     "error": {
       "cannot_read_repo": "Could not read that branch. Check the address, branch and token.",
       "invalid_repo": "That is not a repository address (http or https, ending in owner/repository) or a valid branch name.",
-      "unknown_entity": "That sensor does not exist."
+      "unknown_entity": "That sensor does not exist.",
+      "token_needs_https": "A token is only sent over an encrypted connection. Use the repository's https address, or leave the token empty for a public repository."
     },
     "abort": {
       "already_configured": "This device is already set up.",

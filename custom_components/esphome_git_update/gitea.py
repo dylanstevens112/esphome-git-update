@@ -34,6 +34,23 @@ class GiteaError(Exception):
     """Gitea could not be read. The message never contains the token."""
 
 
+class InsecureTokenError(GiteaError):
+    """A token would be sent without encryption (an http address)."""
+
+
+def origin(repo_url: str) -> tuple[str, str, int | None] | None:
+    """Scheme, host and port of an address: the server a token belongs to."""
+    try:
+        parts = urlsplit(repo_url.strip())
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.hostname:
+        return None
+    default = {"http": 80, "https": 443}.get(parts.scheme.lower())
+    return (parts.scheme.lower(), parts.hostname.lower(), port or default)
+
+
 @dataclass(frozen=True)
 class Commit:
     """One commit on the branch."""
@@ -82,6 +99,8 @@ class GiteaRepo:
             segments[-1] = segments[-1][:-4]
         if not BRANCH.fullmatch(branch):
             raise GiteaError("not a branch name")
+        if token and parts.scheme != "https":
+            raise InsecureTokenError("a token needs an https address")
         base = "/".join(quote(s, safe="") for s in segments[:-2])
         prefix = f"{parts.scheme}://{parts.netloc}" + (f"/{base}" if base else "")
         owner_repo = "/".join(quote(s, safe="") for s in segments[-2:])

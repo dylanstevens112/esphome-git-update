@@ -20,6 +20,8 @@ REV = "sensor.panel_firmware_revision"
 ENTITY = "update.panel_code"
 NEW = "30736b4d91db388cceeb235424e364b36d25c54c"
 TOKEN = "s3cr3t-token-value"
+HAPI = "https://gitea.test/api/v1/repos/owner/repo"
+HREPO = "https://gitea.test/owner/repo"
 DATA = {
     "configuration": "panel.yaml",
     "revision_entity": REV,
@@ -31,9 +33,9 @@ FLOW = "custom_components.esphome_git_update.config_flow.async_get_dashboard"
 UPDATE = "custom_components.esphome_git_update.update.async_get_dashboard"
 
 
-def mock_branch(aioclient_mock, sha=NEW, message="fix(vacuum): new IDs\n\nbody", **kwargs):
+def mock_branch(aioclient_mock, sha=NEW, message="fix(vacuum): new IDs\n\nbody", api=API, **kwargs):
     aioclient_mock.get(
-        f"{API}/branches/main", json={"commit": {"id": sha, "message": message}}, **kwargs
+        f"{api}/branches/main", json={"commit": {"id": sha, "message": message}}, **kwargs
     )
 
 
@@ -53,6 +55,7 @@ async def setup(hass: HomeAssistant, aioclient_mock, revision="b675152", data=No
     hass.config.components.add("esphome")  # the real one needs a device
     hass.states.async_set(REV, revision)
     mock_branch(aioclient_mock)
+    mock_branch(aioclient_mock, api=HAPI)
     entry = MockConfigEntry(
         domain=DOMAIN, title="Panel", data=data or DATA, unique_id="panel.yaml"
     )
@@ -288,12 +291,14 @@ async def test_bad_answers_are_refused(hass, aioclient_mock, answer):
 async def test_token_goes_only_to_gitea_and_is_never_logged(hass, aioclient_mock, caplog):
     caplog.set_level(logging.DEBUG)
     hass.config.components.add("esphome")
-    aioclient_mock.get(f"{API}/branches/main", status=500)
-    entry = MockConfigEntry(domain=DOMAIN, title="Panel", data={**DATA, "token": TOKEN})
+    aioclient_mock.get(f"{HAPI}/branches/main", status=500)
+    entry = MockConfigEntry(
+        domain=DOMAIN, title="Panel", data={**DATA, "repo_url": HREPO, "token": TOKEN}
+    )
     entry.add_to_hass(hass)
     await hass.config_entries.async_setup(entry.entry_id)
     (_method, url, _data, headers) = aioclient_mock.mock_calls[-1]
-    assert str(url).startswith(API)
+    assert str(url).startswith(HAPI)
     assert headers["Authorization"] == f"token {TOKEN}"
     assert TOKEN not in caplog.text
 
@@ -420,14 +425,22 @@ async def test_flow_picks_device_and_suggests_its_sensor(hass, aioclient_mock, e
         assert result["errors"] == {"revision_entity": "unknown_entity"}
 
         aioclient_mock.clear_requests()
-        mock_branch(aioclient_mock)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**details, "token": TOKEN}
+        )
+        assert result["errors"] == {"base": "token_needs_https"}
+        assert aioclient_mock.call_count == 0  # refused before anything is sent
+        schema = {str(k): k for k in result["data_schema"].schema}
+        assert schema["token"].default is vol.UNDEFINED  # never put back in the form
+
+        mock_branch(aioclient_mock, api=HAPI)
         with patch("custom_components.esphome_git_update.async_setup_entry", return_value=True):
             result = await hass.config_entries.flow.async_configure(
-                result["flow_id"], {**details, "repo_url": REPO + "/ ", "token": TOKEN}
+                result["flow_id"], {**details, "repo_url": HREPO + "/ ", "token": TOKEN}
             )
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "Panel"
-    assert result["data"] == {**DATA, "repo_url": REPO + "/", "token": TOKEN}
+    assert result["data"] == {**DATA, "repo_url": HREPO + "/", "token": TOKEN}
     assert result["result"].unique_id == "panel.yaml"
 
 
@@ -441,8 +454,8 @@ async def test_flow_offers_only_devices_not_yet_set_up(hass):
 
 
 async def test_reconfigure_keeps_or_clears_the_token(hass, aioclient_mock):
-    entry = await setup(hass, aioclient_mock, data={**DATA, "token": TOKEN})
-    details = {"revision_entity": REV, "repo_url": REPO, "branch": "main"}
+    entry = await setup(hass, aioclient_mock, data={**DATA, "repo_url": HREPO, "token": TOKEN})
+    details = {"revision_entity": REV, "repo_url": HREPO + "/", "branch": "main"}
 
     result = await entry.start_reconfigure_flow(hass)
     assert result["step_id"] == "details"
@@ -451,7 +464,8 @@ async def test_reconfigure_keeps_or_clears_the_token(hass, aioclient_mock):
     assert schema["token"].default is vol.UNDEFINED  # the saved token is never shown
     result = await hass.config_entries.flow.async_configure(result["flow_id"], details)
     assert result["reason"] == "reconfigure_successful"
-    assert entry.data["token"] == TOKEN
+    assert entry.data["token"] == TOKEN  # same server: kept
+    assert aioclient_mock.mock_calls[-1][3]["Authorization"] == f"token {TOKEN}"
 
     result = await entry.start_reconfigure_flow(hass)
     result = await hass.config_entries.flow.async_configure(
@@ -459,3 +473,46 @@ async def test_reconfigure_keeps_or_clears_the_token(hass, aioclient_mock):
     )
     assert result["reason"] == "reconfigure_successful"
     assert entry.data["token"] == ""
+
+
+@pytest.mark.parametrize(
+    "new_url",
+    [
+        "https://elsewhere.test/owner/repo",  # another host
+        "https://gitea.test:8443/owner/repo",  # another port
+        "http://gitea.test/owner/repo",  # no longer encrypted
+    ],
+)
+async def test_saved_token_never_goes_to_another_server(hass, aioclient_mock, new_url):
+    entry = await setup(hass, aioclient_mock, data={**DATA, "repo_url": HREPO, "token": TOKEN})
+    new_api = new_url.replace("/owner/repo", "/api/v1/repos/owner/repo")
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(f"{new_api}/branches/main", status=404)
+    details = {"revision_entity": REV, "repo_url": new_url, "branch": "main"}
+
+    result = await entry.start_reconfigure_flow(hass)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], details)
+    assert result["errors"] == {"base": "cannot_read_repo"}
+    # Submitting again after the error must not reuse the token either.
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], details)
+    assert result["errors"] == {"base": "cannot_read_repo"}
+    assert aioclient_mock.call_count == 2
+    for _method, url, _data, headers in aioclient_mock.mock_calls:
+        assert str(url).startswith(new_api)
+        assert "Authorization" not in (headers or {})
+
+    aioclient_mock.clear_requests()
+    mock_branch(aioclient_mock, api=new_api)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], details)
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data["token"] == ""  # left behind with the old server
+    assert entry.data["repo_url"] == new_url
+
+
+async def test_saved_http_token_is_refused_without_sending(hass, aioclient_mock):
+    hass.config.components.add("esphome")
+    entry = MockConfigEntry(domain=DOMAIN, title="Panel", data={**DATA, "token": TOKEN})
+    entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(entry.entry_id)
+    assert entry.state is config_entries.ConfigEntryState.SETUP_ERROR
+    assert aioclient_mock.call_count == 0

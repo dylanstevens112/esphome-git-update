@@ -55,11 +55,12 @@ By hand: copy `custom_components/esphome_git_update` to
 2. Check the suggested commit sensor (one whose name contains "revision",
    "commit" or "git"), and enter the repository's web address and branch.
    A token is only needed for a private repository: create one in Gitea with
-   **repository: read** and nothing else.
+   **repository: read** and nothing else. A token needs the repository's
+   `https` address.
 
 Settings can be changed later with **Reconfigure**. A saved token is never shown
-again; leave the field empty to keep it, or tick **Remove the saved access
-token**.
+again; leave the field empty to keep it (only while the server stays the
+same), or tick **Remove the saved access token**.
 
 The update appears on the device's page as **Code**.
 
@@ -114,11 +115,15 @@ text_sensor:
 
 ## Security
 
-- **Token.** Stored in the config entry like other Home Assistant credentials,
-  sent only as a request header to the repository address you entered, never
-  in an address, log line or error message. Redirects are not followed, so it
-  cannot be passed on to another server. Use a read-only token, and an `https`
-  address if the repository is reached over an untrusted network.
+- **Token.** Only sent over `https`: an `http` address with a token is
+  refused before anything is sent (a public repository needs no token and
+  works over `http`). Stored in the config entry like other Home Assistant
+  credentials, sent only as a request header to the server it was entered
+  for, never in an address, log line or error message, and never shown in
+  the form again. Reconfigure keeps a saved token only while the server
+  (scheme, host and port) stays the same; moving to another server drops it.
+  Redirects are not followed, so it cannot be passed on. Use a read-only
+  token.
 - **What is read.** Only the branch and the comparison between two commits.
   Answers over 2 MB, or that are not the expected shape, are refused; commit
   hashes are checked before they are used in an address; commit messages are

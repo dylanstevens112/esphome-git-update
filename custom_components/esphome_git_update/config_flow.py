@@ -26,7 +26,7 @@ from .const import (
     DOMAIN,
     REVISION_SENSOR_WORDS,
 )
-from .gitea import GiteaError, GiteaRepo
+from .gitea import GiteaError, GiteaRepo, InsecureTokenError, origin
 
 
 class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -96,14 +96,25 @@ class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def async_step_details(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         reconfigure = self.source == SOURCE_RECONFIGURE
-        current = dict(self._get_reconfigure_entry().data) if reconfigure else {}
+        # The saved settings decide about the token; "current" only refills the form.
+        saved = dict(self._get_reconfigure_entry().data) if reconfigure else {}
+        current = dict(saved)
         errors: dict[str, str] = {}
 
         if user_input is not None:
             values = {k: v.strip() if isinstance(v, str) else v for k, v in user_input.items()}
             token = values.get(CONF_TOKEN) or ""
-            if reconfigure and token == "" and not values.get("clear_token"):
-                token = current.get(CONF_TOKEN, "")  # empty field keeps the saved token
+            if (
+                reconfigure
+                and token == ""
+                and not values.get("clear_token")
+                and saved.get(CONF_TOKEN)
+                and origin(values[CONF_REPO_URL]) is not None
+                and origin(values[CONF_REPO_URL]) == origin(saved.get(CONF_REPO_URL, ""))
+            ):
+                # An empty field keeps the saved token, but only for the same
+                # server: a token is never sent to a server it was not given for.
+                token = saved[CONF_TOKEN]
             data = {
                 CONF_CONFIGURATION: self._configuration,
                 CONF_REVISION_ENTITY: values[CONF_REVISION_ENTITY],
@@ -116,6 +127,8 @@ class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
             else:
                 try:
                     repo = GiteaRepo(self.hass, data[CONF_REPO_URL], data[CONF_BRANCH], token or None)
+                except InsecureTokenError:
+                    errors["base"] = "token_needs_https"
                 except GiteaError:
                     errors["base"] = "invalid_repo"
                 else:
@@ -129,7 +142,8 @@ class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
                         self._get_reconfigure_entry(), data=data
                     )
                 return self.async_create_entry(title=self._title or self._configuration, data=data)
-            current = {**current, **data}
+            # Never put a token back into the form.
+            current = {**current, **{k: v for k, v in data.items() if k != CONF_TOKEN}}
 
         schema: dict[Any, Any] = {
             vol.Required(
@@ -145,7 +159,7 @@ class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
                 selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
             ),
         }
-        if reconfigure and current.get(CONF_TOKEN):
+        if reconfigure and saved.get(CONF_TOKEN):
             schema[vol.Optional("clear_token", default=False)] = bool
         return self.async_show_form(
             step_id="details",
