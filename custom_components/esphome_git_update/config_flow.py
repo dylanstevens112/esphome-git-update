@@ -165,7 +165,10 @@ class GitUpdateConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="details",
             data_schema=vol.Schema(schema),
             errors=errors,
-            description_placeholders={"device": self._title or self._configuration or ""},
+            description_placeholders={
+                "device": self._title or self._configuration or "",
+                "example_url": "https://git.example.com/owner/repo",
+            },
         )
 
     def _suggest_revision_sensor(self) -> str | None:

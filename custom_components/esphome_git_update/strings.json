@@ -20,7 +20,7 @@
         },
         "data_description": {
           "revision_entity": "A text sensor on the device that reports the Git commit it was built from, e.g. 1a2b3c4.",
-          "repo_url": "The repository's web address, e.g. https://git.example.com/owner/repo.",
+          "repo_url": "The repository's web address, e.g. {example_url}.",
           "token": "A read-only token, sent only over https and only to this server. Leave empty for a public repository. When reconfiguring, leave empty to keep the saved token (only while the server stays the same)."
         }
       }
