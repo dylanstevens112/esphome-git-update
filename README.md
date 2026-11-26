@@ -14,8 +14,12 @@ has a commit the device is not running, and installs it with one tap from
 - **Release notes** list the commits since the installed one, and the link opens
   the repository's comparison.
 - **Install** asks ESPHome Device Builder to build the device and upload it over
-  the air, the same two steps as Home Assistant's own ESPHome update. Progress
-  shows while it runs; a failed build or upload is reported as an error.
+  the air, the same two steps as Home Assistant's own ESPHome update. Before
+  uploading it waits for the device to be connected (for a device in deep
+  sleep, until it wakes), and afterwards until the device reports the commit it
+  now runs. The update shows as installing until then; a failed build, a device
+  that does not come online, a failed upload or a device that never reports
+  new firmware is reported as an error.
 - One entry per device, each with its own repository, branch and token.
 
 ## Requirements
@@ -61,18 +65,23 @@ By hand: copy `custom_components/esphome_git_update` to
    A token is only needed for a private repository: create one in Gitea with
    **repository: read** and nothing else. A token needs the repository's
    `https` address.
-3. Optionally list the files whose changes need no new build, one pattern per
-   line, for example:
+3. Optionally choose which changed files count, one pattern per line:
+   - **Only changes to these files count**: for a repository several devices
+     share, the device's own folder and the shared parts it uses. Other
+     devices' changes then are not offered here.
+   - **Changes that need no new build**: files that never count.
 
    ```text
-   *.md
-   docs/
+   Only changes to these files count:   kitchen/
+                                        common/
+   Changes that need no new build:      *.md
+                                        docs/
    ```
 
-   A commit that only changes matching files is then not offered as an update.
-   `*` also matches `/` (so `*.md` matches Markdown files in every folder), and
-   a pattern ending in `/` matches a whole folder. Paths are relative to the
-   repository root and case-sensitive.
+   A commit is offered only if it changes a file that counts. Both empty (the
+   default): every commit counts. `*` also matches `/` (so `*.md` matches
+   Markdown files in every folder), and a pattern ending in `/` matches a whole
+   folder. Paths are relative to the repository root and case-sensitive.
 
 If Gitea later refuses the token (expired or removed), Home Assistant asks for
 a new one under **Settings → Devices & services** instead of retrying.
@@ -150,7 +159,10 @@ copy's `external_components` entry and add `url` and `ref`.
 ## Limits
 
 - Any new commit counts, including ones that do not change the firmware,
-  unless its files are listed under the files that need no new build.
+  unless file patterns say otherwise.
+- Waiting for the device to connect uses the connection data of Home
+  Assistant's ESPHome integration. If the device is not set up there, Install
+  uploads straight away, and a sleeping device may miss it.
 - Install builds the newest commit at the time of the build, which may be newer
   than the one shown if a commit lands in between.
 - Install uses Home Assistant's connection to Device Builder, which is not a

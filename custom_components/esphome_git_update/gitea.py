@@ -22,6 +22,7 @@ from .const import (
     CONF_REPO_URL,
     CONF_REVISION_ENTITY,
     CONF_TOKEN,
+    CONF_WATCHED_FILES,
     LOCAL_SUFFIX,
     POLL_INTERVAL,
 )
@@ -54,7 +55,7 @@ def same_commit(a: str, b: str) -> bool:
     return a.startswith(b) or b.startswith(a)
 
 
-def ignored(path: str, patterns: list[str]) -> bool:
+def matches(path: str, patterns: tuple[str, ...]) -> bool:
     """A file matches one of the patterns ("*.md", "docs/", "docs/*.txt").
 
     As in fnmatch, "*" also matches "/", so "*.md" matches every Markdown file.
@@ -65,15 +66,34 @@ def ignored(path: str, patterns: list[str]) -> bool:
     )
 
 
-def needs_build(commit: Commit, patterns: list[str]) -> bool:
-    """Whether a commit changes a file that is not ignored.
+@dataclass(frozen=True)
+class FileFilter:
+    """Which changed files mean the device needs a new build.
 
-    Unknown files count as a change, so an unexpected answer never hides an
-    update.
+    A file counts if it matches a watched pattern (or none are set) and no
+    ignored pattern. No patterns at all: every commit counts.
     """
-    if commit.files is None:
-        return True
-    return any(not ignored(f, patterns) for f in commit.files)
+
+    watched: tuple[str, ...] = ()
+    ignored: tuple[str, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.watched or self.ignored)
+
+    def counts(self, path: str) -> bool:
+        return (not self.watched or matches(path, self.watched)) and not matches(
+            path, self.ignored
+        )
+
+    def needs_build(self, commit: Commit) -> bool:
+        """Whether a commit changes a file that counts.
+
+        Unknown files count as a change, so an unexpected answer never hides
+        an update.
+        """
+        if commit.files is None:
+            return True
+        return any(self.counts(f) for f in commit.files)
 
 
 class GiteaError(Exception):
@@ -233,7 +253,7 @@ class Branch:
     """The branch, and what changed since the device's commit when that matters."""
 
     tip: Commit
-    # With ignored files set: the device commit the changes were read for, and
+    # With a file filter: the device commit the changes were read for, and
     # the commits after it up to the tip (None when they could not be read).
     base: str | None = None
     changes: tuple[Commit, ...] | None = None
@@ -257,7 +277,10 @@ class GiteaCoordinator(DataUpdateCoordinator[Branch]):
             entry.data.get(CONF_TOKEN) or None,
         )
         self.revision_entity: str = entry.data[CONF_REVISION_ENTITY]
-        self.ignored_files: list[str] = list(entry.data.get(CONF_IGNORED_FILES) or [])
+        self.file_filter = FileFilter(
+            watched=tuple(entry.data.get(CONF_WATCHED_FILES) or ()),
+            ignored=tuple(entry.data.get(CONF_IGNORED_FILES) or ()),
+        )
 
     async def _async_update_data(self) -> Branch:
         try:
@@ -267,7 +290,7 @@ class GiteaCoordinator(DataUpdateCoordinator[Branch]):
             raise ConfigEntryAuthFailed(f"{self.repo.web_url} refused the access token") from err
         except GiteaError as err:
             raise UpdateFailed(f"Could not read {self.repo.web_url} ({err})") from err
-        if not self.ignored_files:
+        if not self.file_filter:
             return Branch(tip)
         state = self.hass.states.get(self.revision_entity)
         revision = device_revision(state.state if state else None)

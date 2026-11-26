@@ -39,7 +39,16 @@ def mock_branch(aioclient_mock, sha=NEW, message="fix(vacuum): new IDs\n\nbody",
     )
 
 
-def dashboard(compile_ok=True, uploads=(True,), devices=None):
+_HASS = []
+
+
+@pytest.fixture(autouse=True)
+def _remember_hass(hass):
+    """For the fake Device Builder: a device reports its new firmware after an upload."""
+    _HASS[:] = [hass]
+
+
+def dashboard(compile_ok=True, uploads=(True,), devices=None, report="30736b4"):
     dash = MagicMock()
     dash.last_update_success = True
     dash.supports_build_queue = True
@@ -47,7 +56,15 @@ def dashboard(compile_ok=True, uploads=(True,), devices=None):
         "panel": {"name": "panel", "friendly_name": "Panel", "configuration": "panel.yaml"}
     }
     dash.api.compile = AsyncMock(return_value=compile_ok)
-    dash.api.upload = AsyncMock(side_effect=list(uploads))
+    results = list(uploads)
+
+    async def upload(*_args):
+        ok = results.pop(0)
+        if ok and report:
+            _HASS[0].states.async_set(REV, report)  # restarted on the new firmware
+        return ok
+
+    dash.api.upload = AsyncMock(side_effect=upload)
     return dash
 
 
@@ -536,9 +553,12 @@ def mock_compare(aioclient_mock, *commits, base="b675152", status=200):
     )
 
 
-def test_patterns():
+async def test_patterns():
     from custom_components.esphome_git_update.config_flow import parse_patterns
-    from custom_components.esphome_git_update.gitea import ignored
+    from custom_components.esphome_git_update.gitea import FileFilter, matches
+
+    def ignored(path, patterns):
+        return matches(path, tuple(patterns))
 
     assert parse_patterns(" *.md\n\n./docs/, /LICENSE\n*.md ") == ["*.md", "docs/", "LICENSE"]
     assert parse_patterns("") == []
@@ -552,6 +572,12 @@ def test_patterns():
     assert not ignored("panel/panel.yaml", patterns)
     assert not ignored("docsite/x.yaml", patterns)  # "docs/" is a folder only
     assert not ignored("README.MD", patterns)  # case matters, as in Git
+    both = FileFilter(watched=("kitchen/", "common/"), ignored=("*.md",))
+    assert both.counts("kitchen/panel.yaml")
+    assert both.counts("common/fonts.yaml")
+    assert not both.counts("hallway/panel.yaml")  # another device's folder
+    assert not both.counts("kitchen/README.md")  # watched, but ignored
+    assert FileFilter().counts("anything") and not FileFilter()
 
 
 async def test_commits_changing_only_ignored_files_are_not_offered(
@@ -585,7 +611,7 @@ async def test_only_commits_needing_a_build_are_listed(hass, aioclient_mock, has
     assert "**1 new commit**" in text
     assert "- `ee36859` fix: brightness" in text
     assert "docs: spec" not in text
-    assert "2 other commits only change ignored files." in text
+    assert "2 other commits change only files that do not count for this device." in text
 
 
 @pytest.mark.parametrize(
@@ -810,3 +836,137 @@ async def test_full_hash_is_compared(hass, aioclient_mock):
     hass.states.async_set(REV, NEW)
     await hass.async_block_till_done()
     assert hass.states.get(ENTITY).state == "off"
+
+
+# --- watched files, waiting for the device, confirming the install ----------
+
+
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        (("hallway/panel.yaml", "hallway/README.md"), "off"),  # another device
+        (("common/fonts.yaml",), "on"),  # shared part this device uses
+        (("kitchen/panel.yaml",), "on"),
+        (("kitchen/notes.md",), "off"),  # watched folder, ignored file
+    ],
+)
+async def test_watched_files(hass, aioclient_mock, files, expected):
+    mock_compare(aioclient_mock, commit(NEW, "change", *files))
+    data = {**DATA, "watched_files": ["kitchen/", "common/"], "ignored_files": ["*.md"]}
+    await setup(hass, aioclient_mock, data=data)
+    assert hass.states.get(ENTITY).state == expected
+
+
+async def test_flow_saves_watched_files(hass, aioclient_mock):
+    entry = await setup(hass, aioclient_mock)
+    mock_compare(aioclient_mock, commit(NEW, "change", "hallway/panel.yaml"))
+    result = await entry.start_reconfigure_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"revision_entity": REV, "repo_url": REPO, "branch": "main",
+         "watched_files": "kitchen/\ncommon/"},
+    )
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.data["watched_files"] == ["kitchen/", "common/"]
+    assert "ignored_files" not in entry.data
+    await hass.async_block_till_done()
+    assert hass.states.get(ENTITY).state == "off"
+
+
+class FakeConnection:
+    """ESPHome's runtime data, as much of it as the install uses."""
+
+    def __init__(self, available, deep_sleep):
+        self.available = available
+        self.device_info = MagicMock(has_deep_sleep=deep_sleep)
+        self.listeners = set()
+
+    def async_subscribe_device_updated(self, listener):
+        self.listeners.add(listener)
+        return lambda: self.listeners.discard(listener)
+
+    def connect(self):
+        self.available = True
+        for listener in list(self.listeners):
+            listener()
+
+
+async def sleeping_panel(hass, aioclient_mock, available=False):
+    connection = FakeConnection(available=available, deep_sleep=True)
+    esphome = MockConfigEntry(domain="esphome", data={"device_name": "panel"})
+    esphome.add_to_hass(hass)
+    esphome.runtime_data = connection
+    await setup(hass, aioclient_mock, data={**DATA, "node_name": "panel"})
+    return connection
+
+
+async def test_waits_for_a_sleeping_device_before_uploading(hass, aioclient_mock):
+    connection = await sleeping_panel(hass, aioclient_mock)
+    dash = dashboard()
+    with patch(UPDATE, return_value=dash):
+        task = hass.async_create_task(install(hass))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        dash.api.compile.assert_awaited_once()
+        dash.api.upload.assert_not_awaited()  # asleep: nothing sent yet
+        assert hass.states.get(ENTITY).attributes["in_progress"] is True
+        connection.connect()
+        await task
+    dash.api.upload.assert_awaited_once_with("panel.yaml", "OTA")
+    assert not connection.listeners
+    state = hass.states.get(ENTITY)
+    assert state.attributes["in_progress"] is False
+    assert state.attributes["installed_version"] == "30736b4"
+
+
+async def test_device_that_never_wakes_is_reported(hass, aioclient_mock):
+    connection = await sleeping_panel(hass, aioclient_mock)
+    dash = dashboard()
+    with patch(UPDATE, return_value=dash), patch(
+        "custom_components.esphome_git_update.update.WAKE_TIMEOUT_S", 0.05
+    ), pytest.raises(HomeAssistantError) as err:
+        await install(hass)
+    assert err.value.translation_key == "device_offline"
+    dash.api.upload.assert_not_awaited()
+    assert not connection.listeners
+    assert hass.states.get(ENTITY).attributes["in_progress"] is False
+
+
+async def test_connected_device_is_uploaded_at_once(hass, aioclient_mock):
+    await sleeping_panel(hass, aioclient_mock, available=True)
+    dash = dashboard()
+    with patch(UPDATE, return_value=dash):
+        await install(hass)
+    dash.api.upload.assert_awaited_once()
+
+
+async def test_install_waits_for_the_new_firmware(hass, aioclient_mock):
+    await setup(hass, aioclient_mock)
+    dash = dashboard(report=None)
+    with patch(UPDATE, return_value=dash):
+        task = hass.async_create_task(install(hass))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        dash.api.upload.assert_awaited_once()
+        assert hass.states.get(ENTITY).attributes["in_progress"] is True  # not confirmed yet
+        hass.states.async_set(REV, "unavailable")  # restarting
+        hass.states.async_set(REV, "b675152")  # the old firmware, reported once more
+        await asyncio.sleep(0)
+        assert not task.done()
+        hass.states.async_set(REV, "ee36859")  # a newer commit than shown: also fine
+        await task
+    state = hass.states.get(ENTITY)
+    assert state.attributes["in_progress"] is False
+    assert state.attributes["installed_version"] == "ee36859"
+
+
+async def test_install_without_new_firmware_is_reported(hass, aioclient_mock):
+    await setup(hass, aioclient_mock)
+    dash = dashboard(report=None)
+    with patch(UPDATE, return_value=dash), patch(
+        "custom_components.esphome_git_update.update.CONFIRM_TIMEOUT_S", 0.05
+    ), pytest.raises(HomeAssistantError) as err:
+        await install(hass)
+    assert err.value.translation_key == "not_confirmed"
+    assert err.value.translation_placeholders["revision"] == "b675152"
+    assert hass.states.get(ENTITY).attributes["in_progress"] is False

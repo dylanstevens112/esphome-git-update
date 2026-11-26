@@ -27,20 +27,28 @@ from .const import (
     CONF_CONFIGURATION,
     CONF_NODE_NAME,
     CONF_REVISION_ENTITY,
+    CONFIRM_TIMEOUT_S,
     DOMAIN,
     LOCAL_SUFFIX,
+    ONLINE_TIMEOUT_S,
     UPLOAD_ATTEMPTS,
     UPLOAD_RETRY_DELAY_S,
     UPLOAD_TIMEOUT_S,
+    WAKE_TIMEOUT_S,
 )
-from .devices import builder_node_name, node_device, sensor_node_name
+from .devices import (
+    builder_node_name,
+    has_deep_sleep,
+    node_connection,
+    node_device,
+    sensor_node_name,
+)
 from .gitea import (
     Commit,
     GiteaCoordinator,
     GiteaError,
     device_revision,
     is_commit,
-    needs_build,
     same_commit,
 )
 
@@ -91,6 +99,8 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
             self._attr_translation_key = None
             self._attr_name = f"{entry.title} code"
         self._install_lock = asyncio.Lock()
+        self._node_name: str | None = entry.data.get(CONF_NODE_NAME)
+        self._new_revision: asyncio.Future[str] | None = None
 
     def _device(self, hass: HomeAssistant, entry: GitUpdateConfigEntry) -> dr.DeviceEntry | None:
         node = entry.data.get(CONF_NODE_NAME) or builder_node_name(hass, self._configuration)
@@ -112,7 +122,11 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
 
     @callback
     def _revision_changed(self, event: Event[EventStateChangedData]) -> None:
-        if self.coordinator.ignored_files:
+        # During an install: the device reports what it runs after the upload.
+        revision = self.installed_version
+        if revision is not None and self._new_revision and not self._new_revision.done():
+            self._new_revision.set_result(revision)
+        if self.coordinator.file_filter:
             # What the device lacks must be read again first; the refresh
             # writes the state, so it never flips to "update" in between.
             self.hass.async_create_task(self.coordinator.async_request_refresh())
@@ -120,10 +134,10 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
             self.async_write_ha_state()
 
     def _changes(self) -> tuple[Commit, ...] | None:
-        """With ignored files: the commits the device lacks, if known."""
+        """With a file filter: the commits the device lacks, if known."""
         data, installed = self.coordinator.data, self._installed_commit()
         if (
-            not self.coordinator.ignored_files
+            not self.coordinator.file_filter
             or data is None
             or installed is None
             or data.base != installed
@@ -132,7 +146,7 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
         return data.changes
 
     def _needing_build(self, commits: tuple[Commit, ...] | list[Commit]) -> list[Commit]:
-        return [c for c in commits if needs_build(c, self.coordinator.ignored_files)]
+        return [c for c in commits if self.coordinator.file_filter.needs_build(c)]
 
     def _installed_commit(self) -> str | None:
         """The commit the device runs, without the "+local" mark."""
@@ -164,7 +178,7 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
         tip = self.coordinator.data.tip.sha if self.coordinator.data else latest_version
         if same_commit(installed_version, tip):
             return False
-        # With ignored files, only commits that change other files count.
+        # With a file filter, only commits that change files that count do.
         # Unknown changes count, as without a filter.
         changes = self._changes()
         return changes is None or bool(self._needing_build(changes))
@@ -189,7 +203,7 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
         installed, latest = self._installed_commit(), self.latest_version
         if not installed or not latest or not self.coordinator.data:
             return None
-        # With ignored files the comparison was already read; reuse it.
+        # With a file filter the comparison was already read; reuse it.
         commits = list(self._changes() or [])
         if not commits:
             try:
@@ -199,13 +213,16 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
         if not commits:
             return _markdown_text(self.coordinator.data.tip.title)
         skipped = 0
-        if self.coordinator.ignored_files:
+        if self.coordinator.file_filter:
             relevant = self._needing_build(commits)
             skipped = len(commits) - len(relevant)
             commits = relevant
         if not commits:
             plural = "s" if skipped != 1 else ""
-            return f"No commit needs a new build: {skipped} commit{plural} only change ignored files."
+            return (
+                f"No commit needs a new build: {skipped} commit{plural} "
+                "change only files that do not count for this device."
+            )
         lines = [f"- `{c.short}` {_markdown_text(c.title)}" for c in commits[:MAX_NOTES]]
         if len(commits) > MAX_NOTES:
             lines.append(f"- … and {len(commits) - MAX_NOTES} older")
@@ -213,7 +230,10 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
         text = f"**{len(commits)} new commit{plural}**\n\n" + "\n".join(lines)
         if skipped:
             plural = "s" if skipped != 1 else ""
-            text += f"\n\n{skipped} other commit{plural} only change ignored files."
+            text += (
+                f"\n\n{skipped} other commit{plural} change only files "
+                "that do not count for this device."
+            )
         return text
 
     async def async_install(self, version: str | None, backup: bool, **kwargs: Any) -> None:
@@ -237,43 +257,125 @@ class GitUpdateEntity(CoordinatorEntity[GiteaCoordinator], UpdateEntity):
                     translation_placeholders={"configuration": self._configuration},
                 )
 
+            before = self.installed_version
             self._attr_in_progress = True
             self.async_write_ha_state()
             try:
-                # Device Builder fetches the branch itself when it builds, so
-                # this installs whatever is newest at that moment.
-                queue = getattr(dashboard, "supports_build_queue", False)
-                lock = contextlib.nullcontext() if queue else build_lock(self.hass)
-                try:
-                    async with lock, asyncio.timeout(COMPILE_TIMEOUT_S):
-                        built = await dashboard.api.compile(self._configuration)
-                except (aiohttp.ClientError, TimeoutError) as err:
-                    _LOGGER.warning("Building %s failed: %s", self._configuration, type(err).__name__)
-                    built = False
-                if not built:
-                    raise HomeAssistantError(
-                        translation_domain=DOMAIN,
-                        translation_key="build_failed",
-                        translation_placeholders={"configuration": self._configuration},
-                    )
-                for attempt in range(1, UPLOAD_ATTEMPTS + 1):
-                    try:
-                        async with asyncio.timeout(UPLOAD_TIMEOUT_S):
-                            uploaded = await dashboard.api.upload(self._configuration, "OTA")
-                    except (aiohttp.ClientError, TimeoutError) as err:
-                        _LOGGER.warning("Upload of %s failed: %s", self._configuration, type(err).__name__)
-                        uploaded = False
-                    if uploaded:
-                        break
-                    if attempt == UPLOAD_ATTEMPTS:
-                        raise HomeAssistantError(
-                            translation_domain=DOMAIN,
-                            translation_key="upload_failed",
-                            translation_placeholders={"device": self._attr_title or ""},
-                        )
-                    _LOGGER.warning("Upload of %s failed, trying again", self._configuration)
-                    await asyncio.sleep(UPLOAD_RETRY_DELAY_S)
+                await self._build(dashboard)
+                # Listen from the start of the upload: a quick restart may
+                # report the new firmware before the upload call returns.
+                self._new_revision = self.hass.loop.create_future()
+                await self._upload(dashboard)
+                await self._confirm(before)
             finally:
+                self._new_revision = None
                 self._attr_in_progress = False
                 self.async_write_ha_state()
         await self.coordinator.async_request_refresh()
+
+    async def _build(self, dashboard: Any) -> None:
+        # Device Builder fetches the branch itself when it builds, so this
+        # installs whatever is newest at that moment.
+        _LOGGER.info("%s: building %s", self._attr_title, self._configuration)
+        queue = getattr(dashboard, "supports_build_queue", False)
+        lock = contextlib.nullcontext() if queue else build_lock(self.hass)
+        try:
+            async with lock, asyncio.timeout(COMPILE_TIMEOUT_S):
+                built = await dashboard.api.compile(self._configuration)
+        except (aiohttp.ClientError, TimeoutError) as err:
+            _LOGGER.warning("Building %s failed: %s", self._configuration, type(err).__name__)
+            built = False
+        if not built:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="build_failed",
+                translation_placeholders={"configuration": self._configuration},
+            )
+
+    async def _upload(self, dashboard: Any) -> None:
+        node = self._node_name or builder_node_name(self.hass, self._configuration)
+        connection = node_connection(self.hass, node) if node else None
+        for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+            await self._wait_online(connection)
+            _LOGGER.info("%s: uploading over the air", self._attr_title)
+            try:
+                async with asyncio.timeout(UPLOAD_TIMEOUT_S):
+                    uploaded = await dashboard.api.upload(self._configuration, "OTA")
+            except (aiohttp.ClientError, TimeoutError) as err:
+                _LOGGER.warning("Upload of %s failed: %s", self._configuration, type(err).__name__)
+                uploaded = False
+            if uploaded:
+                return
+            if attempt == UPLOAD_ATTEMPTS:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="upload_failed",
+                    translation_placeholders={"device": self._attr_title or ""},
+                )
+            # A device that sleeps may have gone to sleep just before the
+            # upload; the next try waits for it to wake again.
+            _LOGGER.warning("Upload of %s failed, trying again", self._configuration)
+            await asyncio.sleep(UPLOAD_RETRY_DELAY_S)
+
+    async def _wait_online(self, connection: Any) -> None:
+        """Wait, within limits, until ESPHome is connected to the device.
+
+        As Home Assistant's own ESPHome update does: a device in deep sleep is
+        only reachable while it is awake. Without ESPHome's connection data
+        (the node is not set up in ESPHome) the upload is simply tried.
+        """
+        if connection is None or connection.available:
+            return
+        sleeps = has_deep_sleep(connection)
+        limit = WAKE_TIMEOUT_S if sleeps else ONLINE_TIMEOUT_S
+        _LOGGER.info(
+            "%s: waiting up to %d minutes for the device to %s",
+            self._attr_title, limit // 60, "wake up" if sleeps else "connect",
+        )
+        online = self.hass.loop.create_future()
+
+        @callback
+        def _changed() -> None:
+            if connection.available and not online.done():
+                online.set_result(None)
+
+        unsubscribe = connection.async_subscribe_device_updated(_changed)
+        try:
+            async with asyncio.timeout(limit):
+                await online
+        except TimeoutError:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="device_offline",
+                translation_placeholders={
+                    "device": self._attr_title or "",
+                    "minutes": str(limit // 60),
+                },
+            ) from None
+        finally:
+            unsubscribe()
+
+    async def _confirm(self, before: str | None) -> None:
+        """Wait, within limits, for the device to report the firmware it now runs."""
+        _LOGGER.info("%s: uploaded, waiting for the device to report its firmware", self._attr_title)
+        try:
+            async with asyncio.timeout(CONFIRM_TIMEOUT_S):
+                while (revision := await self._new_revision) == before:
+                    # Still the old firmware (e.g. reported before restarting).
+                    self._new_revision = self.hass.loop.create_future()
+        except TimeoutError:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="not_confirmed",
+                translation_placeholders={
+                    "device": self._attr_title or "",
+                    "minutes": str(CONFIRM_TIMEOUT_S // 60),
+                    "revision": before or "unknown",
+                },
+            ) from None
+        latest = self.coordinator.data.tip.short if self.coordinator.data else None
+        _LOGGER.info(
+            "%s: now runs %s%s", self._attr_title, revision,
+            "" if latest is None or same_commit(revision.removesuffix(LOCAL_SUFFIX), latest)
+            else f" (the branch was at {latest} when it was last read)",
+        )

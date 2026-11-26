@@ -6,6 +6,8 @@ another ESPHome device.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from homeassistant.components.esphome.const import CONF_DEVICE_NAME
 from homeassistant.components.esphome.const import DOMAIN as ESPHOME_DOMAIN
 from homeassistant.components.esphome.dashboard import async_get_dashboard
@@ -47,3 +49,25 @@ def node_device(hass: HomeAssistant, node_name: str) -> dr.DeviceEntry | None:
         if device.via_device_id is None
     ]
     return found[0] if len(found) == 1 else None
+
+
+def node_connection(hass: HomeAssistant, node_name: str) -> Any | None:
+    """ESPHome's live connection data for a node (its config entry's runtime data).
+
+    Used like Home Assistant's own ESPHome update does: ``available`` (connected
+    now), ``device_info.has_deep_sleep`` and ``async_subscribe_device_updated``.
+    None when the node is not set up in ESPHome or this data looks different.
+    """
+    for entry in hass.config_entries.async_entries(ESPHOME_DOMAIN):
+        if entry.data.get(CONF_DEVICE_NAME) != node_name:
+            continue
+        data = getattr(entry, "runtime_data", None)
+        if isinstance(getattr(data, "available", None), bool) and callable(
+            getattr(data, "async_subscribe_device_updated", None)
+        ):
+            return data
+    return None
+
+
+def has_deep_sleep(connection: Any) -> bool:
+    return bool(getattr(getattr(connection, "device_info", None), "has_deep_sleep", False))

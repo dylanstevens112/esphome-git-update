@@ -17,13 +17,15 @@
           "branch": "Branch",
           "token": "Access token (only for a private repository)",
           "clear_token": "Remove the saved access token",
-          "ignored_files": "Changes that need no new build"
+          "ignored_files": "Changes that need no new build",
+          "watched_files": "Only changes to these files count"
         },
         "data_description": {
           "revision_entity": "A text sensor on the device that reports the Git commit it was built from, e.g. 1a2b3c4.",
           "repo_url": "The repository's web address, e.g. {example_url}.",
           "token": "A read-only token, sent only over https and only to this server. Leave empty for a public repository. When reconfiguring, leave empty to keep the saved token (only while the server stays the same).",
-          "ignored_files": "Optional. One file pattern per line, e.g. *.md or docs/. A commit that only changes matching files is not offered as an update. * also matches /, and a pattern ending in / matches a whole folder."
+          "ignored_files": "Optional. One file pattern per line, e.g. *.md or docs/. A commit that changes only these files (or files outside the ones that count) is not offered as an update. * also matches /, and a pattern ending in / matches a whole folder.",
+          "watched_files": "Optional, for a repository several devices share: this device's folder and the shared parts it uses, one pattern per line, e.g. kitchen/ and common/. Leave empty to count every file."
         }
       },
       "reauth_confirm": {
@@ -73,6 +75,12 @@
     },
     "upload_failed": {
       "message": "Uploading to {device} failed. See the ESPHome Device Builder log."
+    },
+    "device_offline": {
+      "message": "{device} did not connect within {minutes} minutes, so nothing was uploaded. The firmware is built; try again when the device is online."
+    },
+    "not_confirmed": {
+      "message": "The upload to {device} finished, but within {minutes} minutes the device did not report new firmware (it still reports {revision}). Check that it restarted and that its revision sensor publishes."
     }
   }
 }
